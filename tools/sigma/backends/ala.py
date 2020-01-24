@@ -16,9 +16,16 @@
 
 import re
 import xml.etree.ElementTree as xml
+
+from pyparsing import conditionAsParseAction
+
+from ..config.mapping import ConditionalFieldMapping
+from ..parser.condition import SigmaAggregationParser
+from ..parser.exceptions import SigmaParseError
 from .base import SingleTextQueryBackend
 from .data import sysmon_schema
 from .exceptions import NotSupportedError
+
 
 class AzureLogAnalyticsBackend(SingleTextQueryBackend):
     """Converts Sigma rule into Azure Log Analytics Queries."""
@@ -26,6 +33,11 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
     active = True
     options = SingleTextQueryBackend.options + (
             ("sysmon", False, "Generate Sysmon event queries for generic rules", None),
+            (
+                "use_fields",
+                False, 
+                "Use fields to generate project and aggregation clauses",
+                None),
             )
     config_required = False
 
@@ -44,9 +56,26 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
     mapListsSpecialHandling = True
     mapListValueExpression = "%s in %s"
 
+    _WIN_SECURITY_EVENT_MAP = {
+        "Image": "NewProcessName",
+        "ParentImage": "ParentProcessName",
+        "User": "SubjectUserName",
+    }
+
     def __init__(self, *args, **kwargs):
         """Initialize field mappings"""
         super().__init__(*args, **kwargs)
+        self.category = None
+        self.product = None
+        self.service = None
+        self.table = None
+        self.eventid = None
+        self._fields = None
+        self._agg_var = None
+        if not self.sysmon and not self.sigmaconfig.config:
+            self._field_map = self._WIN_SECURITY_EVENT_MAP
+        else:
+            self._field_map = {}
 
     def id_mapping(self, src):
         """Identity mapping, source == target field name"""
@@ -70,13 +99,14 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
 
     def default_value_mapping(self, val):
         op = "=="
-        if type(val) == str:
+        if isinstance(val, str):
             if "*" in val[1:-1]:     # value contains * inside string - use regex match
                 op = "matches regex"
                 val = re.sub('([".^$]|\\\\(?![*?]))', '\\\\\g<1>', val)
                 val = re.sub('\\*', '.*', val)
                 val = re.sub('\\?', '.', val)
-            elif type(val) == str:                           # value possibly only starts and/or ends with *, use prefix/postfix match
+            else:
+                # value possibly only starts and/or ends with *, use prefix/postfix match
                 if val.endswith("*") and val.startswith("*"):
                     op = "contains"
                     val = self.cleanValue(val[1:-1])
@@ -86,12 +116,26 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
                 elif val.startswith("*"):
                     op = "endswith"
                     val = self.cleanValue(val[1:])
-
-                if "\\" in val:
-                    #val = val.replace("\\", "\\\\")
-                    return "%s @\"%s\"" % (op, val)
+                else:
+                    # Handle default escaping in other cases
+                    val = self.cleanValue(val)
 
         return "%s \"%s\"" % (op, val)
+
+    def map_conditional_field(self, fieldname):
+        mapping = self.sigmaconfig.fieldmappings.get(fieldname)
+        # if there is a conditional mapping for this fieldname
+        # and it matches the current event id, get the mapping
+        if (
+            mapping
+            and isinstance(mapping, ConditionalFieldMapping)
+            and "EventID" in mapping.conditions
+        ):
+            fieldname = mapping.conditions["EventID"].get(self.eventid, [fieldname])[0]
+        elif self._field_map:
+            # Fall back to default internal map if no config
+            return self._field_map.get(fieldname, fieldname)
+        return fieldname
 
     def generate(self, sigmaparser):
         self.table = None
@@ -99,18 +143,31 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
             self.category = sigmaparser.parsedyaml['logsource'].setdefault('category', None)
             self.product = sigmaparser.parsedyaml['logsource'].setdefault('product', None)
             self.service = sigmaparser.parsedyaml['logsource'].setdefault('service', None)
+            if self.use_fields:
+                fields = sigmaparser.parsedyaml['fields']
+                self._build_field_list(fields, sigmaparser)
         except KeyError:
-            self.category = None
-            self.product = None
-            self.service = None
+            pass
 
-        if self.category == "process_creation":
-            if self.sysmon:
-                self.table = "Event"
-                self.eventid = "1"
-            else:
-                self.table = "SecurityEvent"
-                self.eventid = "4688"
+        if (
+            self.sigmaconfig.config
+            and not self.sysmon
+            and self.category in self.sigmaconfig.config["logsources"]
+        ):
+            ls_definition = self.sigmaconfig.config["logsources"][self.category]
+            self.table = ls_definition["table"]
+            eventid = ls_definition.get("conditions", {}).get("EventID")
+            self.eventid = str(eventid) if eventid else None
+        if not self.table or not self.eventid:
+            if self.category == "process_creation":
+                if self.sysmon:
+                    self.table = "Event"
+                    self.eventid = "1"
+                    self._field_map = {}
+                else:
+                    self.table = "SecurityEvent"
+                    self.eventid = "4688"
+                    # self._field_map = self._WIN_SECURITY_EVENT_MAP
 
         return super().generate(sigmaparser)
 
@@ -127,19 +184,22 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
             before = "%s | where EventID == \"%s\" | where " % (self.table, self.eventid)
         else:
             before = "%s | where " % self.table
-        return before 
+        return before
 
     def generateMapItemNode(self, node):
         """
-        ALA queries, like ATP, refer to event tables instead of Windows logging event identifiers. This method catches conditions that refer to this field
+        ALA queries, like ATP, refer to event tables instead of Windows logging event
+        identifiers. This method catches conditions that refer to this field
         and creates an appropriate table reference.
         """
         key, value = node
-        if type(value) == list:         # handle map items with values list like multiple OR-chained conditions
+        # names are not mapped from conditional mappings
+        key = self.map_conditional_field(key)
+        if isinstance(value, list):         # handle map items with values list like multiple OR-chained conditions
             return "(" + self.generateORNode(
-                    [(key, v) for v in value]
-                    ) + ")"
-        elif key == "EventID":            # EventIDs are not reflected in condition but in table selection
+                [(key, v) for v in value]
+            ) + ")"
+        if key in ["EventID", "EventId"]:            # EventIDs are not reflected in condition but in table selection
             if self.service == "sysmon":
                 self.table = "Event"
                 self.eventid = value
@@ -147,23 +207,21 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
                 self.table = "SecurityEvent"
             elif self.service == "system":
                 self.table = "Event"
-        elif type(value) in (str, int):     # default value processing
+        elif isinstance(value, (str, int)):     # default value processing
             mapping = (key, self.default_value_mapping)
-            if len(mapping) == 1:
+            if len(mapping) == 1:   # This is never True!
                 mapping = mapping[0]
-                if type(mapping) == str:
+                if isinstance(mapping, str):
                     return mapping
-                elif callable(mapping):
-                    conds = mapping(key, value)
+                if callable(mapping):
                     return self.generateSubexpressionNode(
-                            self.generateANDNode(
-                                [cond for cond in mapping(key, value)]
-                                )
-                            )
+                        self.generateANDNode(list(mapping(key, value)))
+                    )
             elif len(mapping) == 2:
+                # iterate mapping and mapping source value synchronously over key and value
                 result = list()
-                for mapitem, val in zip(mapping, node):     # iterate mapping and mapping source value synchronously over key and value
-                    if type(mapitem) == str:
+                for mapitem, val in zip(mapping, node):
+                    if isinstance(mapitem, str):
                         result.append(mapitem)
                     elif callable(mapitem):
                         result.append(mapitem(val))
@@ -172,6 +230,68 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
                 raise TypeError("Backend does not support map values of type " + str(type(value)))
 
         return super().generateMapItemNode(node)
+
+    def generateAggregation(self, agg):
+        if agg is None:
+            return ""
+        if agg.aggfunc == SigmaAggregationParser.AGGFUNC_NEAR:
+            raise NotImplementedError(
+                "The 'near' aggregation operator is not "
+                + f"implemented for the %s backend" % self.identifier
+            )
+        if agg.aggfunc_notrans != 'count' and agg.aggfield is None:
+            raise NotSupportedError(
+                "The '%s' aggregation operator " % agg.aggfunc_notrans
+                + "must have an aggregation field for the %s backend" % self.identifier
+            )
+        if agg.aggfunc_notrans == 'count' and agg.aggfield is not None:
+            agg_func = "dcount"
+        else:
+            agg_func = agg.aggfunc_notrans
+
+        self._agg_var = agg_func + ("_" + agg.aggfield) if agg.aggfield else ""
+        if not self._fields:
+            by_clause = "by {grp}".format(grp=agg.groupfield if agg.groupfield else "")
+        else:
+            by_clause = "by {grp}".format(grp=", ".join(self._fields))
+        return (
+            " | summarize {var} = {func}({fld}) {by} | where {var} {op} {cond}".format(
+                var=self._agg_var,
+                func=agg_func,
+                fld=agg.aggfield or "",
+                by=by_clause,
+                op=agg.cond_op,
+                cond=agg.condition,
+            )
+        )
+
+    def generateAfter(self, parsed):
+        del parsed
+        if self._fields:
+            all_fields = list(self._fields)
+            if self._agg_var:
+                all_fields = set(all_fields + [self._agg_var])
+
+            project_list = ", ".join(str(fld) for fld in all_fields)
+            return " | project " + project_list
+        return ""
+
+    def _build_field_list(self, fields, sigma_parser):
+        if fields:
+            columns = []
+            for field in fields:
+                mapped = (
+                    sigma_parser.config.get_fieldmapping(field)
+                    .resolve_fieldname(field, sigma_parser)
+                )
+                if isinstance(mapped, str):
+                    columns.append(mapped)
+                elif isinstance(mapped, list):
+                    columns.extend(mapped)
+                else:
+                    raise TypeError("Field mapping must return string or list")
+            self._fields = list(set(columns))
+
 
 class AzureAPIBackend(AzureLogAnalyticsBackend):
     """Converts Sigma rule into Azure Log Analytics Rule."""
