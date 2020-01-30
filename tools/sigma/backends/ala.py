@@ -57,6 +57,7 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
     nullExpression = "isnull(%s)"
     notNullExpression = "isnotnull(%s)"
     mapExpression = "%s == %s"
+    map_ncs_string_map_expression = "%s =~ %s"
     mapListsSpecialHandling = True
     mapListValueExpression = "%s in %s"
 
@@ -105,29 +106,32 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
         return parse_arg
 
     def default_value_mapping(self, val):
-        op = "=="
         if isinstance(val, str):
+            oper = " =~ "
             if "*" in val[1:-1]:     # value contains * inside string - use regex match
-                op = "matches regex"
+                oper = "matches regex"
                 val = re.sub('([".^$]|\\\\(?![*?]))', '\\\\\g<1>', val)
                 val = re.sub('\\*', '.*', val)
                 val = re.sub('\\?', '.', val)
             else:
                 # value possibly only starts and/or ends with *, use prefix/postfix match
-                if val.endswith("*") and val.startswith("*"):
-                    op = "contains"
+                if val.startswith("* ") and val.endswith(" *"):
+                    oper = "has"
+                    val = self.cleanValue(val[2:-2])
+                elif val.startswith("*") and val.endswith("*"):
+                    oper = "contains"
                     val = self.cleanValue(val[1:-1])
                 elif val.endswith("*"):
-                    op = "startswith"
+                    oper = "startswith"
                     val = self.cleanValue(val[:-1])
                 elif val.startswith("*"):
-                    op = "endswith"
+                    oper = "endswith"
                     val = self.cleanValue(val[1:])
                 else:
                     # Handle default escaping in other cases
                     val = self.cleanValue(val)
-
-        return "%s \"%s\"" % (op, val)
+            return "%s \"%s\"" % (oper, val)
+        return "== %s" % val
 
     def generate(self, sigmaparser):
         self.table = None
@@ -224,7 +228,10 @@ class AzureLogAnalyticsBackend(SingleTextQueryBackend):
                 return "{} {}".format(*result)
             else:
                 raise TypeError("Backend does not support map values of type " + str(type(value)))
-
+        elif isinstance(value, SigmaRegularExpressionModifier):
+            return "{field} matches regex \"{val}\"".format(field=key, val=value)
+        if isinstance(value, str):
+            return self.map_ncs_string_map_expression % (key, value)
         return super().generateMapItemNode(node)
 
     def generateAggregation(self, agg):
